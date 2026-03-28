@@ -295,8 +295,10 @@ tr.cr td:first-child{border-left:2px solid var(--red)}
         <div class="ct"><span class="cdot" style="background:var(--green)"></span>S-Curve — Cumulative Progress</div>
         <div class="sc-leg">
           <span><span class="sc-line" style="background:var(--planned)"></span>Planned</span>
+          <span id="scFilteredPlanLegend" style="display:none"><span class="sc-line" style="background:var(--amber);border-top:2px dashed var(--amber)"></span>Planned (filtered)</span>
           <span><span class="sc-line" style="background:var(--actual)"></span>Actual</span>
           <span id="scInfo" class="sc-info" style="display:none">● <span id="scInfoN">0</span> actual points</span>
+          <span id="scFilterPill" style="display:none;background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.4);border-radius:12px;padding:2px 8px;font-size:10px;color:var(--amber);font-weight:600"></span>
         </div>
       </div>
       <div class="cb"><canvas id="scChart"></canvas></div>
@@ -414,6 +416,19 @@ const SC_PLANNED = BASE.s_curve;
 // actualPoints: { "YYYY-MM-DD": overallActualPct }
 // Grows with each upload – old points NEVER removed
 let actualPoints = {...BASE.actual_points};
+
+// uploadSnapshots: [{date, pctMap:{uid:pct}}]
+// One entry per upload (including baseline).
+// Stores the task % complete snapshot AT EACH DATA DATE so the
+// S-curve can recalculate filtered actuals historically.
+let uploadSnapshots = BASE._uploadSnapshots
+  ? BASE._uploadSnapshots.map(s => ({ date: s.date, pctMap: { ...s.pctMap } }))
+  : [
+      {
+        date:   BASE.project.data_date.substring(0,10),
+        pctMap: Object.fromEntries(BASE.leaf.map(t => [t.uid, t.pct]))
+      }
+    ];
 
 // Upload history for display
 let uploadHistory = [
@@ -635,16 +650,61 @@ function drawGauges(p,a) {
 //    between uploads – honest gaps show where we had no data)
 // ═══════════════════════════════════════════════════════════════
 function drawSCurve() {
-  const ctx = document.getElementById('scChart').getContext('2d');
-  const labels  = SC_PLANNED.map(d => d.date);
-  const planned = SC_PLANNED.map(d => d.planned);
+  const ctx   = document.getElementById('scChart').getContext('2d');
+  const tasks = filteredLeaf;   // ← uses CURRENT filtered set
+  const isFiltered = tasks.length < allLeaf.length;
 
-  // Build actual array aligned to labels
-  // For dates with a known actualPoint → use that value
-  // For dates without → null (no line drawn)
-  const actualArr = labels.map(d => actualPoints.hasOwnProperty(d) ? actualPoints[d] : null);
+  // ── Total weight of the filtered task set ──────────────────
+  const totalW = tasks.reduce((s,t) => s + t.dur, 0);
+  if (totalW === 0) return;
 
-  const nPts = Object.keys(actualPoints).length;
+  const labels = SC_PLANNED.map(d => d.date);
+
+  // ── PLANNED: recalculate per day from filtered tasks ────────
+  // Uses ISO string parsing → no seconds-vs-ms mismatch with stored timestamps.
+  const planned = labels.map(dateStr => {
+    const ts = new Date(dateStr + 'T00:00:00').getTime();
+    const pw = tasks.reduce((s, t) => {
+      if (!t.start || !t.finish) return s;
+      const tS = new Date(t.start).getTime();
+      const tF = new Date(t.finish).getTime();
+      const p  = tF === tS
+        ? (ts >= tF ? 100 : 0)
+        : Math.min(Math.max((ts - tS) / (tF - tS) * 100, 0), 100);
+      return s + p * t.dur;
+    }, 0);
+    return parseFloat((pw / totalW).toFixed(2));
+  });
+
+  // ── ACTUAL: for each upload snapshot, recalc using filtered tasks ──
+  // uploadHistory holds {date, actual (overall), ...}
+  // We need to re-derive the filtered actual from each snapshot's pct values.
+  //
+  // We store per-upload task snapshots in uploadSnapshots: [{date, pctMap}]
+  // where pctMap = {uid: pct} at that upload moment.
+  // For the baseline we use current allLeaf pcts (they were the starting point).
+  // For each subsequent upload we stored the pctMap at load time.
+  //
+  // Build actual array per date:
+  const actualArr = labels.map(dateStr => {
+    // Find if we have a snapshot for this date
+    const snap = uploadSnapshots.find(s => s.date === dateStr);
+    if (!snap) return null;
+    // Compute filtered actual from snapshot pctMap
+    let aw = 0;
+    tasks.forEach(t => {
+      const pct = snap.pctMap.hasOwnProperty(t.uid) ? snap.pctMap[t.uid] : t.pct;
+      aw += pct * t.dur;
+    });
+    return parseFloat((aw / totalW).toFixed(2));
+  });
+
+  const nPts = uploadSnapshots.length;
+
+  // ── Filter label ────────────────────────────────────────────
+  const filterLabel = isFiltered
+    ? ` (${tasks.length} tasks filtered)`
+    : ` (all ${tasks.length} tasks)`;
 
   if (charts.sc) charts.sc.destroy();
   charts.sc = new Chart(ctx, {
@@ -653,26 +713,28 @@ function drawSCurve() {
       labels,
       datasets: [
         {
-          label: 'Planned %',
+          label: 'Planned %' + filterLabel,
           data: planned,
-          borderColor: '#3b82f6',
-          backgroundColor: 'rgba(59,130,246,0.06)',
+          borderColor: isFiltered ? '#f59e0b' : '#3b82f6',
+          backgroundColor: isFiltered ? 'rgba(245,158,11,0.06)' : 'rgba(59,130,246,0.06)',
           borderWidth: 2.5,
-          pointRadius: 3, pointBackgroundColor: '#3b82f6',
+          borderDash: isFiltered ? [5,3] : [],
+          pointRadius: 3,
+          pointBackgroundColor: isFiltered ? '#f59e0b' : '#3b82f6',
           fill: true, tension: 0.35, order: 2,
         },
         {
-          label: 'Actual %',
+          label: 'Actual %' + filterLabel,
           data: actualArr,
           borderColor: '#10b981',
           backgroundColor: 'rgba(16,185,129,0.08)',
           borderWidth: 2.5,
-          pointRadius: actualArr.map(v => v!==null ? 6 : 0),
+          pointRadius: actualArr.map(v => v !== null ? 6 : 0),
           pointBackgroundColor: '#10b981',
           pointBorderColor: '#065f46',
           pointBorderWidth: 1.5,
           fill: true, tension: 0.35,
-          spanGaps: false,   // ← don't connect across null gaps
+          spanGaps: false,
           order: 1,
         },
       ]
@@ -686,21 +748,50 @@ function drawSCurve() {
           backgroundColor: '#192540', borderColor: '#243556', borderWidth: 1,
           titleColor: '#e2e8f0', bodyColor: '#94a3b8',
           callbacks: {
-            label: c => ` ${c.dataset.label}: ${c.parsed.y !== null ? c.parsed.y.toFixed(1)+'%' : 'No data'}`
+            title: items => items[0].label,
+            label: c => {
+              const v = c.parsed.y;
+              return v !== null
+                ? ` ${c.dataset.label.split('(')[0].trim()}: ${v.toFixed(1)}%`
+                : ` ${c.dataset.label.split('(')[0].trim()}: No data`;
+            },
+            afterBody: items => {
+              const p = items.find(i => i.datasetIndex === 0);
+              const a = items.find(i => i.datasetIndex === 1);
+              if (p && a && p.parsed.y !== null && a.parsed.y !== null) {
+                const sv = a.parsed.y - p.parsed.y;
+                return [`  SV: ${sv >= 0 ? '+' : ''}${sv.toFixed(1)}%  ${sv >= 0 ? '▲ Ahead' : '▼ Behind'}`];
+              }
+              return [];
+            }
           }
         },
       },
       scales: {
-        x: { ticks: { color: '#475569', font: { size: 9 }, maxRotation: 45 }, grid: { color: 'rgba(23,36,58,0.9)' } },
-        y: { ticks: { color: '#475569', font: { size: 10 }, callback: v => v+'%' }, grid: { color: 'rgba(23,36,58,0.9)' }, min: 0, max: 100 }
+        x: {
+          ticks: { color: '#475569', font: { size: 9 }, maxRotation: 45 },
+          grid: { color: 'rgba(23,36,58,0.9)' }
+        },
+        y: {
+          ticks: { color: '#475569', font: { size: 10 }, callback: v => v + '%' },
+          grid: { color: 'rgba(23,36,58,0.9)' },
+          min: 0, max: 100
+        }
       }
     }
   });
 
   // Update info badge
-  if (nPts > 0) {
-    document.getElementById('scInfo').style.display = 'inline';
-    document.getElementById('scInfoN').textContent  = nPts;
+  document.getElementById('scInfo').style.display = nPts > 0 ? 'inline' : 'none';
+  document.getElementById('scInfoN').textContent  = nPts;
+
+  // Show filter pill on S-curve card
+  const pill = document.getElementById('scFilterPill');
+  if (pill) {
+    pill.style.display = isFiltered ? 'inline-flex' : 'none';
+    pill.textContent   = isFiltered
+      ? `🔽 ${document.getElementById('fWBS').options[document.getElementById('fWBS').selectedIndex].text || 'Filtered'}`
+      : '';
   }
 }
 
@@ -1000,13 +1091,23 @@ function loadUpdated() {
     // ── 9. Update projInfo data date ──
     projInfo.data_date = effectiveDate;
 
-    // ── 10. Record in history ──
+    // ── 10. Record in history + snapshot ──
     uploadHistory.push({
       date:     effectiveDate,
       filename: pendingXml.filename,
       actual:   newActualPct,
       planned:  newPlannedPct,
     });
+    // Store per-task pct snapshot for filtered S-curve recalculation
+    const snapPctMap = {};
+    allLeaf.forEach(t => { snapPctMap[t.uid] = t.pct; });
+    // Replace existing snapshot for this date or add new one
+    const existingSnapIdx = uploadSnapshots.findIndex(s => s.date === effectiveDate);
+    if (existingSnapIdx >= 0) {
+      uploadSnapshots[existingSnapIdx].pctMap = snapPctMap;
+    } else {
+      uploadSnapshots.push({ date: effectiveDate, pctMap: snapPctMap });
+    }
 
     // ── 11. Refresh all UI ──
     filteredLeaf = [...allLeaf];
@@ -1075,13 +1176,15 @@ function showToast(msg) {
 function exportDashboard() {
   // ── a. Build the snapshot data object ──────────────────────
   const snapshot = {
-    project:     { ...projInfo },
-    leaf:        allLeaf.map(t => ({ ...t })),
-    all:         allTasks.map(t => ({ ...t })),
-    s_curve:     SC_PLANNED,               // planned never changes
-    categories:  BASE.categories,
-    wbs_names:   BASE.wbs_names,
-    actual_points: { ...actualPoints },    // ← ALL accumulated points
+    project:       { ...projInfo },
+    leaf:          allLeaf.map(t => ({ ...t })),
+    all:           allTasks.map(t => ({ ...t })),
+    s_curve:       SC_PLANNED,
+    categories:    BASE.categories,
+    wbs_names:     BASE.wbs_names,
+    actual_points: { ...actualPoints },
+    // uploadSnapshots serialised so exported file can also do filtered S-curve
+    _uploadSnapshots: uploadSnapshots.map(s => ({ date: s.date, pctMap: { ...s.pctMap } })),
   };
 
   // ── b. Serialise cleanly ────────────────────────────────────
